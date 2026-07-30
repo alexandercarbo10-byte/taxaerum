@@ -30,6 +30,12 @@ function mountScanner() {
   const input = $('search');
   input.insertAdjacentHTML('afterend', '<div class="actions"><button class="secondary" type="button" onclick="startScanner()">Escanear con cámara</button></div><div id="scannerPanel" hidden><video id="scannerVideo" autoplay muted playsinline></video><div class="actions"><span class="label">Apunta la cámara al código de barras.</span><button class="danger" type="button" onclick="stopScanner()">Cerrar cámara</button></div></div>');
 }
+function mountCashier() {
+  $('payment').insertAdjacentHTML('afterend', '<label style="margin-top:12px">Vendedor/a</label><input id="cashier" maxlength="60" placeholder="Ej. Andrea" />');
+  const input = $('cashier'); input.value = localStorage.getItem('taxaerum-cashier') || '';
+  input.onchange = () => localStorage.setItem('taxaerum-cashier', input.value.trim());
+  $('recentSales').closest('.card').insertAdjacentHTML('beforeend', '<h2 class="title" style="margin-top:22px">Ventas por persona (hoy)</h2><div id="cashierSummary" class="empty">Aún no hay ventas registradas.</div>');
+}
 let scanStream, scanning = false;
 async function startScanner() {
   if (!('BarcodeDetector' in window)) return alert('Este navegador no permite escanear con cámara. Puedes usar la cámara normal del iPhone para leer el código o escribirlo en el buscador.');
@@ -99,7 +105,9 @@ function render() {
   $('todayUnits').textContent = cloudMode ? (summary.todayUnits || 0) : localSales.reduce((sum, sale) => sum + sale.items.reduce((total, item) => total + item.qty, 0), 0);
   $('productRows').innerHTML = db.products.length ? db.products.map(p => `<tr><td><b>${escapeHtml(p.name)}</b><br><small>${escapeHtml(p.category)}</small></td><td>${escapeHtml(p.section)}</td><td class="code">${escapeHtml(p.code || p.barcode)}</td><td>${money(p.price)}</td><td>${Number(p.stock) <= 3 ? `<b style="color:#b64646">${p.stock}</b>` : p.stock}</td><td><button class="danger" onclick="removeProduct(${p.id})">Eliminar</button></td></tr>`).join('') : '<tr><td colspan="6" class="empty">Todavía no has agregado productos.</td></tr>';
   const recent = cloudMode ? db.sales : localSales.slice(-5).reverse();
-  $('recentSales').innerHTML = recent.length ? recent.map(s => `<div class="cart-item"><span>${s.units ?? s.items.length} producto(s) · ${escapeHtml(s.payment)}</span><b>${money(s.total)}</b></div>`).join('') : 'Aún no hay ventas registradas.';
+  $('recentSales').innerHTML = recent.length ? recent.map(s => `<div class="cart-item"><span>${s.units ?? s.items.length} producto(s) · ${escapeHtml(s.payment)}<br><small>${escapeHtml(s.cashier || 'Sin asignar')}</small></span><b>${money(s.total)}</b></div>`).join('') : 'Aún no hay ventas registradas.';
+  const cashierRows = cloudMode ? (summary.byCashier || []) : Object.values(localSales.reduce((all, sale) => { const cashier = sale.cashier || 'Sin asignar'; all[cashier] = all[cashier] || { cashier, sales: 0, total: 0 }; all[cashier].sales++; all[cashier].total += sale.total; return all; }, {}));
+  $('cashierSummary').innerHTML = cashierRows.length ? cashierRows.map(row => `<div class="cart-item"><span><b>${escapeHtml(row.cashier)}</b><br><small>${row.sales} venta(s)</small></span><b>${money(row.total)}</b></div>`).join('') : 'Aún no hay ventas registradas.';
   renderSaleProducts(); renderCatalog(db.products);
 }
 function renderCatalog(products) { $('catalogProducts').innerHTML = products.length ? products.map(p => `<article class="product"><span class="badge">${escapeHtml(p.section)}</span><b style="margin-top:8px">${escapeHtml(p.name)}</b><small>${escapeHtml(p.category)}</small><span class="price">${money(p.price)}</span></article>`).join('') : '<p class="empty">El catálogo se llenará al agregar productos.</p>'; }
@@ -118,9 +126,12 @@ async function completeSale() {
   if (!cart.length) return alert('Agrega al menos un producto.');
   const total = cart.reduce((sum, i) => sum + i.qty * db.products.find(p => p.id === i.id).price, 0);
   try {
-    if (cloudMode) { const result = await api('sales', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ payment: $('payment').value, items: cart }) }); cart = []; await loadCloud(); alert(`Venta guardada correctamente. Total: ${money(result.total)}`); }
-    else { cart.forEach(i => db.products.find(p => p.id === i.id).stock -= i.qty); db.sales.push({ date: new Date().toISOString(), items: cart, payment: $('payment').value, total }); cart = []; save(); render(); alert(`Venta guardada correctamente. Total: ${money(total)}`); }
+    const cashier = $('cashier').value.trim();
+    if (!cashier) return alert('Escribe el nombre del vendedor antes de cobrar.');
+    localStorage.setItem('taxaerum-cashier', cashier);
+    if (cloudMode) { const result = await api('sales', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ payment: $('payment').value, cashier, items: cart }) }); cart = []; await loadCloud(); alert(`Venta guardada correctamente. Total: ${money(result.total)}`); }
+    else { cart.forEach(i => db.products.find(p => p.id === i.id).stock -= i.qty); db.sales.push({ date: new Date().toISOString(), items: cart, payment: $('payment').value, cashier, total }); cart = []; save(); render(); alert(`Venta guardada correctamente. Total: ${money(total)}`); }
   } catch (error) { alert(error.message); }
 }
 async function bootCloud() { try { const response = await fetch('/api/status'); if (!response.ok) throw Error(); cloudAvailable = (await response.json()).cloud; updateCloudButton(); if (cloudToken) await loadCloud(); } catch { cloudAvailable = false; updateCloudButton(); } render(); }
-mountScanner(); render(); bootCloud();
+mountScanner(); mountCashier(); render(); bootCloud();

@@ -52,8 +52,9 @@ async function products(env, publicOnly = false) {
 
 async function dashboard(env) {
   const summary = await env.DB.prepare(`SELECT COALESCE(SUM(s.total),0) AS sales, COALESCE(SUM((SELECT SUM(si.quantity) FROM sale_items si WHERE si.sale_id = s.id)),0) AS units FROM sales s WHERE date(s.created_at, 'localtime') = date('now', 'localtime')`).first();
-  const recent = await env.DB.prepare(`SELECT s.id, s.payment_method AS payment, s.total, s.created_at AS date, COALESCE(SUM(si.quantity),0) AS units, COUNT(si.id) AS item_count FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id GROUP BY s.id ORDER BY s.id DESC LIMIT 5`).all();
-  return { todaySales: Number(summary.sales || 0), todayUnits: Number(summary.units || 0), recentSales: recent.results };
+  const recent = await env.DB.prepare(`SELECT s.id, s.payment_method AS payment, s.cashier_name AS cashier, s.total, s.created_at AS date, COALESCE(SUM(si.quantity),0) AS units, COUNT(si.id) AS item_count FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id GROUP BY s.id ORDER BY s.id DESC LIMIT 5`).all();
+  const byCashier = await env.DB.prepare(`SELECT COALESCE(NULLIF(cashier_name, ''), 'Sin asignar') AS cashier, COUNT(*) AS sales, COALESCE(SUM(total),0) AS total FROM sales WHERE date(created_at, 'localtime') = date('now', 'localtime') GROUP BY cashier ORDER BY total DESC`).all();
+  return { todaySales: Number(summary.sales || 0), todayUnits: Number(summary.units || 0), recentSales: recent.results, byCashier: byCashier.results };
 }
 
 export async function onRequest(context) {
@@ -108,6 +109,7 @@ export async function onRequest(context) {
     const body = await request.json().catch(() => ({}));
     const items = Array.isArray(body.items) ? body.items : [];
     const payment = String(body.payment || 'Efectivo').slice(0, 40);
+    const cashier = String(body.cashier || 'Sin asignar').trim().slice(0, 60) || 'Sin asignar';
     if (!items.length) return json({ error: 'La venta no tiene productos.' }, 400);
     const clean = items.map(item => ({ id: Number(item.id), qty: Number(item.qty) }));
     if (clean.some(item => !Number.isInteger(item.id) || !Number.isInteger(item.qty) || item.qty < 1)) return json({ error: 'Productos de venta inválidos.' }, 400);
@@ -118,7 +120,7 @@ export async function onRequest(context) {
     const available = new Map(values.results.map(product => [product.id, product]));
     for (const item of clean) if (available.get(item.id).stock < item.qty) return json({ error: `No hay suficiente stock de ${available.get(item.id).name}.` }, 400);
     const total = clean.reduce((sum, item) => sum + available.get(item.id).price * item.qty, 0);
-    const sale = await env.DB.prepare('INSERT INTO sales (payment_method, total) VALUES (?, ?)').bind(payment, total).run();
+    const sale = await env.DB.prepare('INSERT INTO sales (payment_method, cashier_name, total) VALUES (?, ?, ?)').bind(payment, cashier, total).run();
     const statements = [];
     for (const item of clean) {
       const product = available.get(item.id);
