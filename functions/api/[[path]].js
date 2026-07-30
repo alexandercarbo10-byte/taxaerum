@@ -26,7 +26,7 @@ async function signingKey(secret) {
 
 async function makeSession(env) {
   const payload = base64url(encoder.encode(JSON.stringify({ exp: Date.now() + 1000 * 60 * 60 * 12 })));
-  const signature = base64url(await crypto.subtle.sign('HMAC', await signingKey(env.SESSION_SECRET), encoder.encode(payload)));
+  const signature = base64url(new Uint8Array(await crypto.subtle.sign('HMAC', await signingKey(env.SESSION_SECRET), encoder.encode(payload))));
   return `${payload}.${signature}`;
 }
 
