@@ -123,7 +123,7 @@ export async function onRequest(context) {
     for (const item of clean) {
       const product = available.get(item.id);
       statements.push(env.DB.prepare('INSERT INTO sale_items (sale_id, product_id, quantity, unit_price) VALUES (?, ?, ?, ?)').bind(sale.meta.last_row_id, item.id, item.qty, product.price));
-      statements.push(env.DB.prepare('UPDATE inventory SET quantity = quantity - ?, updated_at = CURRENT_TIMESTAMP WHERE product_id = ?').bind(item.qty, item.id));
+      statements.push(env.DB.prepare('UPDATE inventory SET quantity = quantity - ? WHERE product_id = ?').bind(item.qty, item.id));
     }
     await env.DB.batch(statements);
     return json({ ok: true, total });

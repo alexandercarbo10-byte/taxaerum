@@ -12,7 +12,36 @@ window.addEventListener('beforeinstallprompt', event => { event.preventDefault()
 $('installButton').onclick = async () => { if (!installPrompt) return; installPrompt.prompt(); await installPrompt.userChoice; installPrompt = null; $('installButton').hidden = true; };
 if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('service-worker.js'));
 
-function makeCode() { return `TX-${Date.now().toString().slice(-8)}${Math.floor(Math.random() * 90 + 10)}`; }
+function eanCheck(body) { return (10 - body.split('').reverse().reduce((sum, digit, index) => sum + Number(digit) * (index % 2 ? 1 : 3), 0) % 10) % 10; }
+function makeCode() { const body = `200${Date.now().toString().slice(-7)}${String(Math.floor(Math.random() * 100)).padStart(2, '0')}`; return `${body}${eanCheck(body)}`; }
+const eanL = ['0001101','0011001','0010011','0111101','0100011','0110001','0101111','0111011','0110111','0001011'];
+const eanG = ['0100111','0110011','0011011','0100001','0011101','0111001','0000101','0010001','0001001','0010111'];
+const eanR = ['1110010','1100110','1101100','1000010','1011100','1001110','1010000','1000100','1001000','1110100'];
+const eanParity = ['LLLLLL','LLGLGG','LLGGLG','LLGGGL','LGLLGG','LGGLLG','LGGGLL','LGLGLG','LGLGGL','LGGLGL'];
+function barcodeHtml(code) {
+  if (!/^\d{13}$/.test(code)) return `<span class="code">${escapeHtml(code)}</span>`;
+  let bars = '101', parity = eanParity[Number(code[0])];
+  for (let i = 1; i <= 6; i++) bars += (parity[i - 1] === 'L' ? eanL : eanG)[Number(code[i])];
+  bars += '01010'; for (let i = 7; i <= 12; i++) bars += eanR[Number(code[i])]; bars += '101';
+  const rects = [...bars].map((bar, index) => bar === '1' ? `<rect x="${index + 9}" y="${index < 3 || (index >= 45 && index < 50) || index >= 92 ? 4 : 10}" width="1" height="${index < 3 || (index >= 45 && index < 50) || index >= 92 ? 50 : 42}"/>` : '').join('');
+  return `<div class="barcode"><svg viewBox="0 0 113 64" role="img" aria-label="Código de barras ${code}"><rect width="113" height="64" fill="white"/>${rects}<text x="56.5" y="61" text-anchor="middle" font-family="monospace" font-size="8">${code}</text></svg></div>`;
+}
+function mountScanner() {
+  const input = $('search');
+  input.insertAdjacentHTML('afterend', '<div class="actions"><button class="secondary" type="button" onclick="startScanner()">Escanear con cámara</button></div><div id="scannerPanel" hidden><video id="scannerVideo" autoplay muted playsinline></video><div class="actions"><span class="label">Apunta la cámara al código de barras.</span><button class="danger" type="button" onclick="stopScanner()">Cerrar cámara</button></div></div>');
+}
+let scanStream, scanning = false;
+async function startScanner() {
+  if (!('BarcodeDetector' in window)) return alert('Este navegador no permite escanear con cámara. Puedes usar la cámara normal del iPhone para leer el código o escribirlo en el buscador.');
+  try {
+    const video = $('scannerVideo'); scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
+    video.srcObject = scanStream; $('scannerPanel').hidden = false; scanning = true;
+    const detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'code_128', 'code_39', 'upc_a'] });
+    const scan = async () => { if (!scanning) return; const found = await detector.detect(video); if (found[0]?.rawValue) { $('search').value = found[0].rawValue; stopScanner(); renderSaleProducts(); return; } requestAnimationFrame(scan); };
+    video.onloadeddata = scan;
+  } catch (error) { stopScanner(); alert('No se pudo abrir la cámara. Revisa que Safari tenga permiso para usarla.'); }
+}
+function stopScanner() { scanning = false; if (scanStream) scanStream.getTracks().forEach(track => track.stop()); scanStream = null; const panel = $('scannerPanel'); if (panel) panel.hidden = true; }
 function headers() { return cloudToken ? { authorization: `Bearer ${cloudToken}` } : {}; }
 async function api(path, options = {}) {
   const response = await fetch(`/api/${path}`, { ...options, headers: { ...headers(), ...(options.headers || {}) } });
@@ -56,7 +85,7 @@ $('productForm').onsubmit = async event => {
   try {
     if (cloudMode) await api('products', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(product) });
     else { db.products.push({ ...product, id: Date.now(), code: product.barcode }); save(); }
-    $('labelPreview').innerHTML = `<b>${escapeHtml(product.name)}</b><div class="barcode"></div><span class="code">${product.barcode}</span><br><b>${money(product.price)}</b>`;
+    $('labelPreview').innerHTML = `<b>${escapeHtml(product.name)}</b>${barcodeHtml(product.barcode)}<b>${money(product.price)}</b>`;
     event.target.reset(); if (cloudMode) await loadCloud(); else render();
   } catch (error) { alert(error.message); }
 };
@@ -94,4 +123,4 @@ async function completeSale() {
   } catch (error) { alert(error.message); }
 }
 async function bootCloud() { try { const response = await fetch('/api/status'); if (!response.ok) throw Error(); cloudAvailable = (await response.json()).cloud; updateCloudButton(); if (cloudToken) await loadCloud(); } catch { cloudAvailable = false; updateCloudButton(); } render(); }
-render(); bootCloud();
+mountScanner(); render(); bootCloud();
