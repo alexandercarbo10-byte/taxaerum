@@ -47,23 +47,33 @@ async function audit(env, actor, action, entity, id = '', detail = '', deviceId 
   await env.DB.prepare('INSERT INTO audit_log (actor_name,actor_role,action,entity_type,entity_id,device_id,detail) VALUES (?,?,?,?,?,?,?)')
     .bind(actorName(actor), actor.role, action, entity, String(id), text(deviceId), text(detail, 500)).run();
 }
-async function getProducts(env, publicOnly = false) {
-  const where = publicOnly ? 'WHERE p.is_public=1 AND p.is_active=1' : '';
-  const result = await env.DB.prepare(`SELECT p.id,p.name,p.description,p.sku,p.section,p.category,p.section_id,p.category_id,p.price,p.price_cents,p.cost_cents,p.barcode,p.min_stock,p.unit,p.is_active,p.is_public,p.updated_at,p.version,i.quantity AS stock FROM products p JOIN inventory i ON i.product_id=p.id ${where} ORDER BY p.name COLLATE NOCASE`).all();
+const businessIdOf = actor => Number(actor?.businessId || 1);
+async function getProducts(env, businessId, publicOnly = false) {
+  const visibility = publicOnly ? ' AND p.is_public=1 AND p.is_active=1' : '';
+  const result = await env.DB.prepare(`SELECT p.id,p.name,p.description,p.sku,p.section,p.category,p.section_id,p.category_id,p.price,p.price_cents,p.cost_cents,p.barcode,p.min_stock,p.unit,p.is_active,p.is_public,p.updated_at,p.version,i.quantity AS stock FROM products p JOIN inventory i ON i.product_id=p.id WHERE p.business_id=?${visibility} ORDER BY p.name COLLATE NOCASE`).bind(businessId).all();
   return result.results;
 }
-async function dashboard(env, cashier = null) {
-  const suffix = cashier ? ' AND cashier_name=?' : '', binds = cashier ? [cashier] : [];
-  const summary = await env.DB.prepare(`SELECT COALESCE(SUM(total_cents),0) AS cents,COALESCE(SUM((SELECT SUM(quantity) FROM sale_items WHERE sale_id=s.id)),0) AS units FROM sales s WHERE status='completed' AND date(created_at,'localtime')=date('now','localtime')${suffix}`).bind(...binds).first();
-  const recent = await env.DB.prepare(`SELECT s.id,s.payment_method AS payment,s.cashier_name AS cashier,s.total_cents,s.created_at AS date,COALESCE(SUM(si.quantity),0) AS units,COUNT(si.id) AS item_count FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id WHERE s.status='completed'${suffix} GROUP BY s.id ORDER BY s.id DESC LIMIT 5`).bind(...binds).all();
-  const byCashier = await env.DB.prepare(`SELECT COALESCE(NULLIF(cashier_name,''),'Sin asignar') AS cashier,COUNT(*) AS sales,COALESCE(SUM(total_cents),0) AS total_cents FROM sales WHERE status='completed' AND date(created_at,'localtime')=date('now','localtime')${suffix} GROUP BY cashier ORDER BY total_cents DESC`).bind(...binds).all();
+async function dashboard(env, businessId, cashier = null) {
+  const suffix = cashier ? ' AND cashier_name=?' : '', binds = cashier ? [businessId, cashier] : [businessId];
+  const summary = await env.DB.prepare(`SELECT COALESCE(SUM(total_cents),0) AS cents,COALESCE(SUM((SELECT SUM(quantity) FROM sale_items WHERE sale_id=s.id)),0) AS units FROM sales s WHERE business_id=? AND status='completed' AND date(created_at,'localtime')=date('now','localtime')${suffix}`).bind(...binds).first();
+  const recent = await env.DB.prepare(`SELECT s.id,s.payment_method AS payment,s.cashier_name AS cashier,s.total_cents,s.created_at AS date,COALESCE(SUM(si.quantity),0) AS units,COUNT(si.id) AS item_count FROM sales s LEFT JOIN sale_items si ON si.sale_id=s.id WHERE s.business_id=? AND s.status='completed'${suffix} GROUP BY s.id ORDER BY s.id DESC LIMIT 5`).bind(...binds).all();
+  const byCashier = await env.DB.prepare(`SELECT COALESCE(NULLIF(cashier_name,''),'Sin asignar') AS cashier,COUNT(*) AS sales,COALESCE(SUM(total_cents),0) AS total_cents FROM sales WHERE business_id=? AND status='completed' AND date(created_at,'localtime')=date('now','localtime')${suffix} GROUP BY cashier ORDER BY total_cents DESC`).bind(...binds).all();
   return { todaySales: Number(summary.cents || 0) / 100, todayUnits: Number(summary.units || 0), recentSales: recent.results.map(row => ({ ...row, total: Number(row.total_cents || 0) / 100 })), byCashier: byCashier.results.map(row => ({ ...row, total: Number(row.total_cents || 0) / 100 })) };
 }
+async function memberships(env, userId) {
+  return (await env.DB.prepare(`SELECT b.id,b.name,b.slug,b.currency,b.timezone,m.role
+    FROM business_members m JOIN businesses b ON b.id=m.business_id
+    WHERE m.user_id=? AND m.is_active=1 AND b.is_active=1 ORDER BY b.name COLLATE NOCASE`).bind(userId).all()).results;
+}
+async function sessionForMember(env, user, member) {
+  return makeSession(env, { role: member.role, cashier: user.display_name, userId: user.id, businessId: member.id, businessSlug: member.slug });
+}
+const slug = value => text(value, 60).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 
 export async function onRequest({ request, env }) {
   if (!env.DB) return json({ error: 'Falta enlazar D1 como DB.' }, 503);
   const current = route(new URL(request.url).pathname);
-  if (request.method === 'GET' && current === 'status') return json({ cloud: true, apiVersion: 2 });
+  if (request.method === 'GET' && current === 'status') return json({ cloud: true, apiVersion: 3 });
 
   if (request.method === 'POST' && current === 'bootstrap-owner') {
     const body = await request.json().catch(() => ({}));
@@ -74,41 +84,85 @@ export async function onRequest({ request, env }) {
     if (existing) return json({ error: 'El propietario ya fue configurado.' }, 409);
     const record = await passwordRecord(password);
     const result = await env.DB.prepare("INSERT INTO users(username,display_name,password_hash,password_salt,role) VALUES(?,?,?,?, 'owner')").bind(username, displayName, record.hash, record.salt).run();
+    await env.DB.prepare("INSERT INTO business_members(business_id,user_id,role) VALUES(1,?,'owner')").bind(result.meta.last_row_id).run();
     return json({ id: result.meta.last_row_id, ok: true }, 201);
   }
   if (request.method === 'POST' && current === 'account-login') {
     const body = await request.json().catch(() => ({})), username = text(body.username, 60), password = body.password;
     const user = await env.DB.prepare('SELECT * FROM users WHERE username=? AND is_active=1').bind(username).first();
     if (!user || !safePassword(password) || await passwordHash(password, user.password_salt) !== user.password_hash) return json({ error: 'Usuario o contraseña incorrectos.' }, 401);
+    const options = await memberships(env, user.id); if (!options.length) return json({ error: 'Esta cuenta no tiene un negocio activo.' }, 403);
+    const requestedSlug = slug(body.businessSlug);
+    const business = requestedSlug ? options.find(item => item.slug === requestedSlug) : options[0];
+    if (!business) return json({ error: 'No tienes acceso a ese negocio.' }, 403);
     await env.DB.prepare('UPDATE users SET last_login_at=CURRENT_TIMESTAMP WHERE id=?').bind(user.id).run();
-    return json({ token: await makeSession(env, { role: user.role, cashier: user.display_name, userId: user.id }), role: user.role, cashier: user.display_name });
+    return json({ token: await sessionForMember(env, user, business), role: business.role, cashier: user.display_name, business, businesses: options });
+  }
+
+  if (request.method === 'POST' && current === 'register-business') {
+    const body = await request.json().catch(() => ({}));
+    const businessName = text(body.businessName, 100), businessSlug = slug(body.businessSlug || businessName);
+    const username = text(body.username, 60), displayName = text(body.displayName, 80), password = body.password;
+    if (!businessName || !/^[a-z0-9-]{3,60}$/.test(businessSlug) || !/^[a-z0-9._-]{3,60}$/i.test(username) || !displayName || !safePassword(password)) return json({ error: 'Revisa negocio, usuario y contraseña (mínimo 8 caracteres).' }, 400);
+    try {
+      const record = await passwordRecord(password);
+      const result = await env.DB.batch([
+        env.DB.prepare('INSERT INTO businesses(name,slug) VALUES(?,?)').bind(businessName, businessSlug),
+        env.DB.prepare("INSERT INTO users(username,display_name,password_hash,password_salt,role) VALUES(?,?,?,?, 'owner')").bind(username, displayName, record.hash, record.salt)
+      ]);
+      const businessId = result[0].meta.last_row_id, userId = result[1].meta.last_row_id;
+      await env.DB.batch([
+        env.DB.prepare("INSERT INTO business_members(business_id,user_id,role) VALUES(?,?,'owner')").bind(businessId, userId),
+        env.DB.prepare("INSERT INTO tenant_sections(business_id,name) VALUES(?, 'General')").bind(businessId)
+      ]);
+      const business = { id: businessId, name: businessName, slug: businessSlug, role: 'owner', currency: 'USD', timezone: 'America/Guayaquil' };
+      return json({ ok: true, token: await sessionForMember(env, { id: userId, display_name: displayName }, business), role: 'owner', cashier: displayName, business, businesses: [business] }, 201);
+    } catch { return json({ error: 'El nombre corto del negocio o el usuario ya existe.' }, 409); }
   }
 
   if (request.method === 'POST' && current === 'login') {
     const { password } = await request.json().catch(() => ({}));
     if (!env.ADMIN_PASSWORD || !env.SESSION_SECRET) return json({ error: 'Faltan secretos de seguridad.' }, 503);
     if (typeof password !== 'string' || password !== env.ADMIN_PASSWORD) return json({ error: 'Contraseña incorrecta.' }, 401);
-    return json({ token: await makeSession(env, { role: 'admin' }), role: 'admin' });
+    return json({ token: await makeSession(env, { role: 'admin', businessId: 1 }), role: 'admin' });
   }
   if (request.method === 'POST' && current === 'seller-login') {
     const { name, pin } = await request.json().catch(() => ({}));
     let sellers = {}; try { sellers = JSON.parse(env.SELLERS_JSON || '{}'); } catch { return json({ error: 'La lista de vendedores no está configurada.' }, 503); }
     const cashier = text(name, 60);
     if (!cashier || typeof sellers[cashier] !== 'string' || sellers[cashier] !== String(pin || '')) return json({ error: 'Nombre o PIN incorrecto.' }, 401);
-    return json({ token: await makeSession(env, { role: 'seller', cashier }), role: 'seller', cashier });
+    return json({ token: await makeSession(env, { role: 'seller', cashier, businessId: 1 }), role: 'seller', cashier });
   }
-  if (request.method === 'GET' && current === 'catalog') return json((await getProducts(env, true)).map(({ id, name, section, category, price, barcode, stock }) => ({ id, name, section, category, price, barcode, availability: stock > 5 ? 'Disponible' : stock > 0 ? 'Pocas unidades' : 'Agotado' })));
+  const catalogMatch = current.match(/^catalog(?:\/([a-z0-9-]+))?$/);
+  if (request.method === 'GET' && catalogMatch) {
+    const business = catalogMatch[1] ? await env.DB.prepare('SELECT id FROM businesses WHERE slug=? AND is_active=1').bind(catalogMatch[1]).first() : { id: 1 };
+    if (!business) return json({ error: 'Negocio no encontrado.' }, 404);
+    return json((await getProducts(env, business.id, true)).map(({ id, name, section, category, price, barcode, stock }) => ({ id, name, section, category, price, barcode, availability: stock > 5 ? 'Disponible' : stock > 0 ? 'Pocas unidades' : 'Agotado' })));
+  }
 
   const actor = await session(request, env); if (!actor) return denied();
+  if (request.method === 'GET' && current === 'businesses') {
+    if (!actor.userId) return json([{ id: 1, name: 'Mi negocio', slug: 'mi-negocio', role: actor.role }]);
+    return json(await memberships(env, actor.userId));
+  }
+  if (request.method === 'POST' && current === 'select-business') {
+    if (!actor.userId) return json({ error: 'Ingresa con una cuenta para cambiar de negocio.' }, 403);
+    const body = await request.json().catch(() => ({})), requestedSlug = slug(body.businessSlug);
+    const options = await memberships(env, actor.userId), business = options.find(item => item.slug === requestedSlug);
+    if (!business) return json({ error: 'No tienes acceso a ese negocio.' }, 403);
+    const user = await env.DB.prepare('SELECT id,display_name FROM users WHERE id=?').bind(actor.userId).first();
+    return json({ token: await sessionForMember(env, user, business), role: business.role, cashier: user.display_name, business, businesses: options });
+  }
   if (request.method === 'GET' && current === 'products') {
-    const result = await getProducts(env);
+    const result = await getProducts(env, businessIdOf(actor));
     return json(actor.role === 'seller' ? result.map(({ cost_cents, ...product }) => product) : result);
   }
-  if (request.method === 'GET' && current === 'dashboard') return json(await dashboard(env, actor.role === 'seller' ? actor.cashier : null));
+  if (request.method === 'GET' && current === 'dashboard') return json(await dashboard(env, businessIdOf(actor), actor.role === 'seller' ? actor.cashier : null));
 
   if (request.method === 'GET' && current === 'users') {
     if (!adminOnly(actor)) return json({ error: 'No tienes permiso para ver usuarios.' }, 403);
-    const result = await env.DB.prepare('SELECT id,username,display_name,role,is_active,created_at,last_login_at FROM users ORDER BY role,display_name').all();
+    const result = await env.DB.prepare(`SELECT u.id,u.username,u.display_name,m.role,m.is_active,u.created_at,u.last_login_at
+      FROM business_members m JOIN users u ON u.id=m.user_id WHERE m.business_id=? ORDER BY m.role,u.display_name`).bind(businessIdOf(actor)).all();
     return json(result.results);
   }
   if (request.method === 'POST' && current === 'users') {
@@ -116,44 +170,44 @@ export async function onRequest({ request, env }) {
     const body = await request.json().catch(() => ({})), username = text(body.username, 60), displayName = text(body.displayName, 80), password = body.password, role = body.role === 'admin' ? 'admin' : 'seller';
     if (role === 'admin' && !ownerOnly(actor)) return json({ error: 'Solo el propietario puede crear administradores.' }, 403);
     if (!/^[a-z0-9._-]{3,60}$/i.test(username) || !displayName || !safePassword(password)) return json({ error: 'Revisa usuario, nombre y contraseña de al menos 8 caracteres.' }, 400);
-    try { const record = await passwordRecord(password), result = await env.DB.prepare('INSERT INTO users(username,display_name,password_hash,password_salt,role) VALUES(?,?,?,?,?)').bind(username, displayName, record.hash, record.salt, role).run(); await audit(env, actor, 'create', 'user', result.meta.last_row_id, `${role}:${username}`, body.deviceId); return json({ id: result.meta.last_row_id }, 201); } catch { return json({ error: 'Ese usuario ya existe.' }, 409); }
+    try { const record = await passwordRecord(password), result = await env.DB.prepare('INSERT INTO users(username,display_name,password_hash,password_salt,role) VALUES(?,?,?,?,?)').bind(username, displayName, record.hash, record.salt, role).run(); await env.DB.prepare('INSERT INTO business_members(business_id,user_id,role) VALUES(?,?,?)').bind(businessIdOf(actor), result.meta.last_row_id, role).run(); await audit(env, actor, 'create', 'user', result.meta.last_row_id, `${role}:${username}`, body.deviceId); return json({ id: result.meta.last_row_id }, 201); } catch { return json({ error: 'Ese usuario ya existe.' }, 409); }
   }
   const userMatch = current.match(/^users\/(\d+)$/);
   if (request.method === 'PATCH' && userMatch) {
     if (!adminOnly(actor)) return json({ error: 'Solo un administrador puede editar usuarios.' }, 403);
-    const id = Number(userMatch[1]), body = await request.json().catch(() => ({})), target = await env.DB.prepare('SELECT * FROM users WHERE id=?').bind(id).first();
+    const id = Number(userMatch[1]), body = await request.json().catch(() => ({})), target = await env.DB.prepare('SELECT u.*,m.role AS member_role,m.is_active AS member_active FROM users u JOIN business_members m ON m.user_id=u.id WHERE u.id=? AND m.business_id=?').bind(id, businessIdOf(actor)).first();
     if (!target) return json({ error: 'Usuario no encontrado.' }, 404);
-    if ((target.role === 'owner' || body.role === 'admin') && !ownerOnly(actor)) return json({ error: 'Solo el propietario puede modificar administradores o propietario.' }, 403);
-    const displayName = text(body.displayName, 80) || target.display_name, active = body.isActive === undefined ? target.is_active : (body.isActive ? 1 : 0), nextRole = ownerOnly(actor) && ['admin','seller'].includes(body.role) ? body.role : target.role;
-    if (target.role === 'owner' && !active) return json({ error: 'No se puede desactivar al propietario.' }, 409);
+    if ((target.member_role === 'owner' || body.role === 'admin') && !ownerOnly(actor)) return json({ error: 'Solo el propietario puede modificar administradores o propietario.' }, 403);
+    const displayName = text(body.displayName, 80) || target.display_name, active = body.isActive === undefined ? target.member_active : (body.isActive ? 1 : 0), nextRole = ownerOnly(actor) && ['admin','seller'].includes(body.role) ? body.role : target.member_role;
+    if (target.member_role === 'owner' && !active) return json({ error: 'No se puede desactivar al propietario.' }, 409);
     let passwordHashValue = target.password_hash, passwordSalt = target.password_salt;
     if (body.password !== undefined) { if (!safePassword(body.password)) return json({ error: 'La contraseña debe tener al menos 8 caracteres.' }, 400); const record = await passwordRecord(body.password); passwordHashValue = record.hash; passwordSalt = record.salt; }
-    await env.DB.prepare('UPDATE users SET display_name=?,password_hash=?,password_salt=?,role=?,is_active=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(displayName, passwordHashValue, passwordSalt, nextRole, active, id).run();
+    await env.DB.batch([env.DB.prepare('UPDATE users SET display_name=?,password_hash=?,password_salt=?,updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(displayName, passwordHashValue, passwordSalt, id), env.DB.prepare('UPDATE business_members SET role=?,is_active=?,updated_at=CURRENT_TIMESTAMP WHERE business_id=? AND user_id=?').bind(nextRole, active, businessIdOf(actor), id)]);
     await audit(env, actor, 'update', 'user', id, `${nextRole}:${active ? 'active' : 'inactive'}`, body.deviceId); return json({ ok: true });
   }
   const transferMatch = current.match(/^users\/(\d+)\/transfer-ownership$/);
   if (request.method === 'POST' && transferMatch) {
     if (!ownerOnly(actor)) return json({ error: 'Solo el propietario puede transferir el negocio.' }, 403);
     const body = await request.json().catch(() => ({})); if (body.confirmation !== 'TRANSFERIR') return json({ error: 'Confirma la transferencia escribiendo TRANSFERIR.' }, 400);
-    const target = await env.DB.prepare("SELECT id,display_name FROM users WHERE id=? AND role='admin' AND is_active=1").bind(Number(transferMatch[1])).first();
+    const target = await env.DB.prepare("SELECT u.id,u.display_name FROM users u JOIN business_members m ON m.user_id=u.id WHERE u.id=? AND m.business_id=? AND m.role='admin' AND m.is_active=1").bind(Number(transferMatch[1]), businessIdOf(actor)).first();
     if (!target) return json({ error: 'El nuevo propietario debe ser un administrador activo.' }, 409);
-    await env.DB.batch([env.DB.prepare("UPDATE users SET role='admin',updated_at=CURRENT_TIMESTAMP WHERE role='owner'"), env.DB.prepare("UPDATE users SET role='owner',updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(target.id)]);
+    await env.DB.batch([env.DB.prepare("UPDATE business_members SET role='admin',updated_at=CURRENT_TIMESTAMP WHERE business_id=? AND role='owner'").bind(businessIdOf(actor)), env.DB.prepare("UPDATE business_members SET role='owner',updated_at=CURRENT_TIMESTAMP WHERE business_id=? AND user_id=?").bind(businessIdOf(actor), target.id)]);
     await audit(env, actor, 'transfer_ownership', 'user', target.id, target.display_name, body.deviceId); return json({ ok: true });
   }
 
-  if (current === 'sections' && request.method === 'GET') return json((await env.DB.prepare('SELECT * FROM business_sections ORDER BY sort_order,name').all()).results);
-  if (current === 'categories' && request.method === 'GET') return json((await env.DB.prepare('SELECT * FROM business_categories ORDER BY sort_order,name').all()).results);
+  if (current === 'sections' && request.method === 'GET') return json((await env.DB.prepare('SELECT * FROM tenant_sections WHERE business_id=? ORDER BY sort_order,name').bind(businessIdOf(actor)).all()).results);
+  if (current === 'categories' && request.method === 'GET') return json((await env.DB.prepare('SELECT * FROM tenant_categories WHERE business_id=? ORDER BY sort_order,name').bind(businessIdOf(actor)).all()).results);
   if (current === 'sections' && request.method === 'POST') {
     if (!adminOnly(actor)) return json({ error: 'Solo el administrador puede configurar secciones.' }, 403);
     const body = await request.json().catch(() => ({})), name = text(body.name);
     if (!name) return json({ error: 'Escribe el nombre de la sección.' }, 400);
-    try { const result = await env.DB.prepare('INSERT INTO business_sections(name,sort_order) VALUES (?,?)').bind(name, Number(body.sortOrder) || 0).run(); await audit(env, actor, 'create', 'section', result.meta.last_row_id, name, body.deviceId); return json({ id: result.meta.last_row_id }, 201); } catch { return json({ error: 'La sección ya existe.' }, 409); }
+    try { const result = await env.DB.prepare('INSERT INTO tenant_sections(business_id,name,sort_order) VALUES (?,?,?)').bind(businessIdOf(actor), name, Number(body.sortOrder) || 0).run(); await audit(env, actor, 'create', 'section', result.meta.last_row_id, name, body.deviceId); return json({ id: result.meta.last_row_id }, 201); } catch { return json({ error: 'La sección ya existe.' }, 409); }
   }
   if (current === 'categories' && request.method === 'POST') {
     if (!adminOnly(actor)) return json({ error: 'Solo el administrador puede configurar categorías.' }, 403);
     const body = await request.json().catch(() => ({})), name = text(body.name), sectionId = body.sectionId === null ? null : Number(body.sectionId);
     if (!name || (sectionId !== null && !Number.isInteger(sectionId))) return json({ error: 'Revisa categoría y sección.' }, 400);
-    try { const result = await env.DB.prepare('INSERT INTO business_categories(section_id,name,sort_order) VALUES (?,?,?)').bind(sectionId, name, Number(body.sortOrder) || 0).run(); await audit(env, actor, 'create', 'category', result.meta.last_row_id, name, body.deviceId); return json({ id: result.meta.last_row_id }, 201); } catch { return json({ error: 'La categoría ya existe en esa sección.' }, 409); }
+    try { const result = await env.DB.prepare('INSERT INTO tenant_categories(business_id,section_id,name,sort_order) VALUES (?,?,?,?)').bind(businessIdOf(actor), sectionId, name, Number(body.sortOrder) || 0).run(); await audit(env, actor, 'create', 'category', result.meta.last_row_id, name, body.deviceId); return json({ id: result.meta.last_row_id }, 201); } catch { return json({ error: 'La categoría ya existe en esa sección.' }, 409); }
   }
 
   if (request.method === 'POST' && current === 'products') {
@@ -162,7 +216,7 @@ export async function onRequest({ request, env }) {
     const name = text(body.name), barcode = text(body.barcode, 40), priceCents = cents(body.price), stock = Number(body.stock);
     if (!name || !isValidEan13(barcode) || priceCents === null || !Number.isInteger(stock) || stock < 0) return json({ error: 'Revisa nombre, precio, stock y un EAN-13 válido.' }, 400);
     try {
-      const created = await env.DB.prepare('INSERT INTO products(name,description,sku,section,category,price,price_cents,cost_cents,barcode,min_stock,unit,is_active) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)').bind(name, text(body.description, 1000), text(body.sku, 80) || null, text(body.section) || 'General', text(body.category) || 'Sin categoría', priceCents / 100, priceCents, cents(body.cost) || 0, barcode, Number.isInteger(Number(body.minStock)) ? Number(body.minStock) : 3, text(body.unit, 40) || 'unidad').run();
+      const created = await env.DB.prepare('INSERT INTO products(business_id,name,description,sku,section,category,price,price_cents,cost_cents,barcode,min_stock,unit,is_active) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)').bind(businessIdOf(actor), name, text(body.description, 1000), text(body.sku, 80) || null, text(body.section) || 'General', text(body.category) || 'Sin categoría', priceCents / 100, priceCents, cents(body.cost) || 0, barcode, Number.isInteger(Number(body.minStock)) ? Number(body.minStock) : 3, text(body.unit, 40) || 'unidad').run();
       await env.DB.batch([env.DB.prepare('INSERT INTO inventory(product_id,quantity) VALUES(?,?)').bind(created.meta.last_row_id, stock), env.DB.prepare("INSERT INTO inventory_movements(product_id,movement_type,quantity_before,quantity_change,quantity_after,reason,actor_name,reference_type) VALUES(?,'initial',0,?,?, 'Stock inicial',?,'product')").bind(created.meta.last_row_id, stock, stock, actorName(actor))]);
       await audit(env, actor, 'create', 'product', created.meta.last_row_id, name, body.deviceId); return json({ id: created.meta.last_row_id }, 201);
     } catch { return json({ error: 'Ese código o SKU ya existe.' }, 409); }
@@ -174,10 +228,10 @@ export async function onRequest({ request, env }) {
     const body = await request.json().catch(() => ({})), id = Number(productMatch[1]);
     const name = text(body.name), priceCents = cents(body.price), stock = Number(body.stock);
     if (!name || priceCents === null || !Number.isInteger(stock) || stock < 0) return json({ error: 'Revisa nombre, precio y stock.' }, 400);
-    const before = await env.DB.prepare('SELECT quantity FROM inventory WHERE product_id=?').bind(id).first(); if (!before) return json({ error: 'Producto no encontrado.' }, 404);
+    const before = await env.DB.prepare('SELECT i.quantity FROM inventory i JOIN products p ON p.id=i.product_id WHERE i.product_id=? AND p.business_id=?').bind(id, businessIdOf(actor)).first(); if (!before) return json({ error: 'Producto no encontrado.' }, 404);
     const change = stock - Number(before.quantity);
     await env.DB.batch([
-      env.DB.prepare('UPDATE products SET name=?,description=?,sku=?,section=?,category=?,price=?,price_cents=?,cost_cents=?,min_stock=?,unit=?,updated_at=CURRENT_TIMESTAMP,version=version+1 WHERE id=?').bind(name, text(body.description, 1000), text(body.sku, 80) || null, text(body.section) || 'General', text(body.category) || 'Sin categoría', priceCents / 100, priceCents, cents(body.cost) || 0, Number.isInteger(Number(body.minStock)) ? Number(body.minStock) : 3, text(body.unit, 40) || 'unidad', id),
+      env.DB.prepare('UPDATE products SET name=?,description=?,sku=?,section=?,category=?,price=?,price_cents=?,cost_cents=?,min_stock=?,unit=?,updated_at=CURRENT_TIMESTAMP,version=version+1 WHERE id=? AND business_id=?').bind(name, text(body.description, 1000), text(body.sku, 80) || null, text(body.section) || 'General', text(body.category) || 'Sin categoría', priceCents / 100, priceCents, cents(body.cost) || 0, Number.isInteger(Number(body.minStock)) ? Number(body.minStock) : 3, text(body.unit, 40) || 'unidad', id, businessIdOf(actor)),
       env.DB.prepare('UPDATE inventory SET quantity=? WHERE product_id=?').bind(stock, id),
       env.DB.prepare("INSERT INTO inventory_movements(product_id,movement_type,quantity_before,quantity_change,quantity_after,reason,actor_name,device_id,reference_type) VALUES(?,'adjustment',?,?,?,?,?,?,'product')").bind(id, before.quantity, change, stock, text(body.reason, 300) || 'Ajuste manual', actorName(actor), text(body.deviceId))
     ]);
@@ -190,17 +244,17 @@ export async function onRequest({ request, env }) {
     const idempotencyKey = text(request.headers.get('idempotency-key') || body.idempotencyKey, 100), deviceId = text(body.deviceId, 120);
     const cashier = actor.role === 'seller' ? actor.cashier : (text(body.cashier, 60) || 'Sin asignar'), payment = text(body.payment, 40) || 'Efectivo';
     if (!/^[a-zA-Z0-9-]{16,100}$/.test(idempotencyKey)) return json({ error: 'Falta una clave válida de idempotencia.' }, 400);
-    const previous = await env.DB.prepare('SELECT id,total_cents FROM sales WHERE idempotency_key=?').bind(idempotencyKey).first();
+    const previous = await env.DB.prepare('SELECT id,total_cents FROM sales WHERE business_id=? AND idempotency_key=?').bind(businessIdOf(actor), idempotencyKey).first();
     if (previous) return json({ ok: true, duplicate: true, saleId: previous.id, total: Number(previous.total_cents) / 100 });
     const clean = items.map(item => ({ id: Number(item.id), qty: Number(item.qty) }));
     if (!clean.length || clean.some(item => !Number.isInteger(item.id) || !Number.isInteger(item.qty) || item.qty < 1)) return json({ error: 'La venta no tiene productos válidos.' }, 400);
     const ids = [...new Set(clean.map(item => item.id))]; if (ids.length !== clean.length) return json({ error: 'Producto repetido en la venta.' }, 400);
-    const found = await env.DB.prepare(`SELECT p.id,p.name,p.price_cents,i.quantity AS stock FROM products p JOIN inventory i ON i.product_id=p.id WHERE p.is_active=1 AND p.id IN (${ids.map(() => '?').join(',')})`).bind(...ids).all();
+    const found = await env.DB.prepare(`SELECT p.id,p.name,p.price_cents,i.quantity AS stock FROM products p JOIN inventory i ON i.product_id=p.id WHERE p.business_id=? AND p.is_active=1 AND p.id IN (${ids.map(() => '?').join(',')})`).bind(businessIdOf(actor), ...ids).all();
     if (found.results.length !== clean.length) return json({ error: 'Uno de los productos no está disponible.' }, 409);
     const available = new Map(found.results.map(product => [product.id, product]));
     for (const item of clean) if (Number(available.get(item.id).stock) < item.qty) return json({ error: `No hay suficiente stock de ${available.get(item.id).name}.` }, 409);
     const totalCents = clean.reduce((sum, item) => sum + Number(available.get(item.id).price_cents) * item.qty, 0), statements = [];
-    statements.push(env.DB.prepare("INSERT INTO sales(payment_method,cashier_name,total,total_cents,idempotency_key,device_id,note) VALUES(?,?,?,?,?,?,?)").bind(payment, cashier, totalCents / 100, totalCents, idempotencyKey, deviceId || null, text(body.note, 500)));
+    statements.push(env.DB.prepare("INSERT INTO sales(business_id,payment_method,cashier_name,total,total_cents,idempotency_key,device_id,note) VALUES(?,?,?,?,?,?,?,?)").bind(businessIdOf(actor), payment, cashier, totalCents / 100, totalCents, idempotencyKey, deviceId || null, text(body.note, 500)));
     for (const item of clean) {
       const product = available.get(item.id), after = Number(product.stock) - item.qty;
       statements.push(env.DB.prepare('INSERT INTO sale_items(sale_id,product_id,quantity,unit_price,unit_price_cents) VALUES((SELECT id FROM sales WHERE idempotency_key=?),?,?,?,?)').bind(idempotencyKey, item.id, item.qty, Number(product.price_cents) / 100, product.price_cents));
@@ -208,11 +262,11 @@ export async function onRequest({ request, env }) {
       statements.push(env.DB.prepare("INSERT INTO inventory_movements(product_id,movement_type,quantity_before,quantity_change,quantity_after,reason,actor_name,device_id,reference_type,reference_id,idempotency_key) VALUES(?,'sale',?,?,?,'Venta',?,?, 'sale',(SELECT id FROM sales WHERE idempotency_key=?),?)").bind(item.id, product.stock, -item.qty, after, cashier, deviceId || null, idempotencyKey, `${idempotencyKey}-${item.id}`));
     }
     try { await env.DB.batch(statements); } catch {
-      const duplicate = await env.DB.prepare('SELECT id,total_cents FROM sales WHERE idempotency_key=?').bind(idempotencyKey).first();
+      const duplicate = await env.DB.prepare('SELECT id,total_cents FROM sales WHERE business_id=? AND idempotency_key=?').bind(businessIdOf(actor), idempotencyKey).first();
       if (duplicate) return json({ ok: true, duplicate: true, saleId: duplicate.id, total: Number(duplicate.total_cents) / 100 });
       return json({ error: 'No se pudo registrar la venta. Revisa stock y vuelve a sincronizar.' }, 409);
     }
-    const sale = await env.DB.prepare('SELECT id FROM sales WHERE idempotency_key=?').bind(idempotencyKey).first();
+    const sale = await env.DB.prepare('SELECT id FROM sales WHERE business_id=? AND idempotency_key=?').bind(businessIdOf(actor), idempotencyKey).first();
     await audit(env, actor, 'create', 'sale', sale.id, `Venta ${payment}`, deviceId);
     return json({ ok: true, saleId: sale.id, total: totalCents / 100 });
   }
