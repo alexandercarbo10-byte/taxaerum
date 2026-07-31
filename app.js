@@ -4,6 +4,8 @@ let cart = [], cloudAvailable = false, cloudMode = false, syncing = false;
 let cloudToken = localStorage.getItem('taxaerum-session') || '';
 let cloudRole = localStorage.getItem('taxaerum-role') || 'admin';
 let cloudCashier = localStorage.getItem('taxaerum-session-cashier') || '';
+let cloudBusiness = JSON.parse(localStorage.getItem('taxaerum-business') || 'null');
+let cloudBusinesses = JSON.parse(localStorage.getItem('taxaerum-businesses') || '[]');
 let businessSections = [], businessCategories = [], businessUsers = [];
 const isManager = () => cloudRole === 'owner' || cloudRole === 'admin';
 const deviceId = localStorage.getItem('taxaerum-device-id') || (() => { const id = crypto.randomUUID ? crypto.randomUUID() : `device-${Date.now()}-${Math.random().toString(16).slice(2)}`; localStorage.setItem('taxaerum-device-id', id); return id; })();
@@ -56,8 +58,12 @@ function mountProductDetails() {
 function mountRoleAccess() {
   $('cloudButton').insertAdjacentHTML('afterend', '<button id="sellerButton" class="secondary" hidden>Entrar como vendedor</button>');
   $('sellerButton').insertAdjacentHTML('afterend', '<button id="accountButton" class="secondary" hidden>Entrar con usuario</button>');
+  $('accountButton').insertAdjacentHTML('afterend', '<button id="createBusinessButton" class="secondary" hidden>Crear mi negocio</button>');
+  $('createBusinessButton').insertAdjacentHTML('afterend', '<button id="switchBusinessButton" class="secondary" hidden>Cambiar negocio</button>');
   $('sellerButton').onclick = connectSeller;
   $('accountButton').onclick = connectAccount;
+  $('createBusinessButton').onclick = registerBusiness;
+  $('switchBusinessButton').onclick = switchBusiness;
 }
 function mountSyncStatus() {
   document.querySelector('main.wrap').insertAdjacentHTML('afterbegin', '<div id="syncStatus" class="notice" role="status" aria-live="polite" style="display:none"></div>');
@@ -180,12 +186,21 @@ function applyAccess() {
   document.querySelector('[data-view="configuracion"]').hidden = seller;
   if (seller) { $('cashier').value = cloudCashier; $('cashier').disabled = true; } else $('cashier').disabled = false;
 }
-function clearSession() { cloudMode = false; cloudToken = ''; cloudCashier = ''; localStorage.removeItem('taxaerum-session'); localStorage.removeItem('taxaerum-role'); localStorage.removeItem('taxaerum-session-cashier'); }
+function saveSession(data) {
+  cloudToken = data.token; cloudRole = data.role; cloudCashier = data.cashier || ''; cloudBusiness = data.business || null; cloudBusinesses = data.businesses || [];
+  localStorage.setItem('taxaerum-session', cloudToken); localStorage.setItem('taxaerum-role', cloudRole);
+  if (cloudCashier) localStorage.setItem('taxaerum-session-cashier', cloudCashier); else localStorage.removeItem('taxaerum-session-cashier');
+  if (cloudBusiness) localStorage.setItem('taxaerum-business', JSON.stringify(cloudBusiness)); else localStorage.removeItem('taxaerum-business');
+  localStorage.setItem('taxaerum-businesses', JSON.stringify(cloudBusinesses));
+}
+function clearSession() { cloudMode = false; cloudToken = ''; cloudCashier = ''; cloudBusiness = null; cloudBusinesses = []; localStorage.removeItem('taxaerum-session'); localStorage.removeItem('taxaerum-role'); localStorage.removeItem('taxaerum-session-cashier'); localStorage.removeItem('taxaerum-business'); localStorage.removeItem('taxaerum-businesses'); }
 function updateCloudButton() {
-  const admin = $('cloudButton'), seller = $('sellerButton'), account = $('accountButton');
+  const admin = $('cloudButton'), seller = $('sellerButton'), account = $('accountButton'), createBusiness = $('createBusinessButton'), switcher = $('switchBusinessButton');
   admin.hidden = !cloudAvailable || (cloudMode && cloudRole === 'seller'); seller.hidden = !cloudAvailable || (cloudMode && isManager());
   account.hidden = !cloudAvailable || cloudMode;
-  admin.textContent = cloudMode ? 'Administrador conectado' : 'Entrar como administrador'; admin.className = cloudMode ? 'primary' : 'secondary';
+  createBusiness.hidden = !cloudAvailable || cloudMode;
+  switcher.hidden = !cloudAvailable || !cloudMode || cloudBusinesses.length < 2;
+  admin.textContent = cloudMode ? `${cloudBusiness?.name || 'Negocio'} conectado` : 'Entrar como administrador'; admin.className = cloudMode ? 'primary' : 'secondary';
   seller.textContent = cloudMode ? `Vendedor: ${cloudCashier}` : 'Entrar como vendedor'; seller.className = cloudMode ? 'primary' : 'secondary'; applyAccess();
 }
 async function loadCloud() {
@@ -202,7 +217,7 @@ async function connectCloud() {
     const response = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }) });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || 'No se pudo iniciar sesión.');
-    cloudToken = data.token; cloudRole = 'admin'; cloudCashier = ''; localStorage.setItem('taxaerum-session', cloudToken); localStorage.setItem('taxaerum-role', cloudRole); localStorage.removeItem('taxaerum-session-cashier'); await loadCloud();
+    saveSession({ ...data, role: 'admin', cashier: '', business: { id: 1, name: 'Mi negocio', slug: 'mi-negocio', role: 'admin' }, businesses: [{ id: 1, name: 'Mi negocio', slug: 'mi-negocio', role: 'admin' }] }); await loadCloud();
   } catch (error) { alert(error.message); }
 }
 $('cloudButton').onclick = connectCloud;
@@ -213,7 +228,7 @@ async function connectSeller() {
   try {
     const response = await fetch('/api/seller-login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name.trim(), pin }) });
     const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || 'No se pudo iniciar sesión.');
-    cloudToken = data.token; cloudRole = 'seller'; cloudCashier = data.cashier; localStorage.setItem('taxaerum-session', cloudToken); localStorage.setItem('taxaerum-role', cloudRole); localStorage.setItem('taxaerum-session-cashier', cloudCashier); await loadCloud();
+    saveSession({ ...data, role: 'seller', business: { id: 1, name: 'Mi negocio', slug: 'mi-negocio', role: 'seller' }, businesses: [{ id: 1, name: 'Mi negocio', slug: 'mi-negocio', role: 'seller' }] }); await loadCloud();
   } catch (error) { alert(error.message); }
 }
 async function connectAccount() {
@@ -222,7 +237,27 @@ async function connectAccount() {
   try {
     const response = await fetch('/api/account-login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: username.trim(), password }) });
     const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || 'No se pudo iniciar sesión.');
-    cloudToken = data.token; cloudRole = data.role; cloudCashier = data.cashier || ''; localStorage.setItem('taxaerum-session', cloudToken); localStorage.setItem('taxaerum-role', cloudRole); if (cloudCashier) localStorage.setItem('taxaerum-session-cashier', cloudCashier); await loadCloud();
+    saveSession(data); await loadCloud();
+  } catch (error) { alert(error.message); }
+}
+async function registerBusiness() {
+  const businessName = prompt('Nombre de tu negocio:'); if (!businessName) return;
+  const businessSlug = prompt('Nombre corto para tu enlace (solo letras, números y guiones):', businessName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')); if (!businessSlug) return;
+  const username = prompt('Usuario del propietario:'); if (!username) return;
+  const displayName = prompt('Tu nombre visible:'); if (!displayName) return;
+  const password = prompt('Crea una contraseña de al menos 8 caracteres:'); if (!password) return;
+  try {
+    const response = await fetch('/api/register-business', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ businessName, businessSlug, username, displayName, password }) });
+    const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || 'No se pudo crear el negocio.');
+    saveSession(data); alert(`Negocio creado. Tu catálogo público será: taxaerum.pages.dev/?negocio=${data.business.slug}#catalogo`); await loadCloud();
+  } catch (error) { alert(error.message); }
+}
+async function switchBusiness() {
+  const choices = cloudBusinesses.map(item => `${item.slug} — ${item.name}`).join('\n');
+  const businessSlug = prompt(`Escribe el nombre corto del negocio al que deseas entrar:\n${choices}`, cloudBusiness?.slug || ''); if (!businessSlug) return;
+  try {
+    const data = await api('select-business', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ businessSlug }) });
+    saveSession(data); await loadCloud();
   } catch (error) { alert(error.message); }
 }
 
@@ -266,7 +301,7 @@ function render() {
   renderSaleProducts(); renderCatalog(db.products);
 }
 function renderCatalog(products) { $('catalogProducts').innerHTML = products.length ? products.map(p => `<article class="product"><span class="badge">${escapeHtml(p.section)}</span><b style="margin-top:8px">${escapeHtml(p.name)}</b><small>${escapeHtml(p.category)}</small><span class="price">${money(p.price)}</span></article>`).join('') : '<p class="empty">El catálogo se llenará al agregar productos.</p>'; }
-async function loadPublicCatalog() { if (!cloudAvailable) return; try { const result = await fetch('/api/catalog'); if (result.ok) renderCatalog(await result.json()); } catch {} }
+async function loadPublicCatalog() { if (!cloudAvailable) return; try { const slug = new URLSearchParams(location.search).get('negocio') || cloudBusiness?.slug; const result = await fetch(`/api/catalog${slug ? `/${encodeURIComponent(slug)}` : ''}`); if (result.ok) renderCatalog(await result.json()); } catch {} }
 async function editProduct(id) {
   if (!cloudMode || !isManager()) return alert('Solo el administrador puede editar productos.');
   const product = db.products.find(item => item.id === Number(id)); if (!product) return;
