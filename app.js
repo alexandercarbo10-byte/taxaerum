@@ -12,7 +12,14 @@ const escapeHtml = value => { const node = document.createElement('div'); node.t
 let installPrompt;
 window.addEventListener('beforeinstallprompt', event => { event.preventDefault(); installPrompt = event; $('installButton').hidden = false; });
 $('installButton').onclick = async () => { if (!installPrompt) return; installPrompt.prompt(); await installPrompt.userChoice; installPrompt = null; $('installButton').hidden = true; };
-if ('serviceWorker' in navigator) window.addEventListener('load', () => navigator.serviceWorker.register('service-worker.js'));
+if ('serviceWorker' in navigator) window.addEventListener('load', async () => {
+  const registration = await navigator.serviceWorker.register('service-worker.js');
+  registration.update();
+  let refreshed = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (!refreshed) { refreshed = true; window.location.reload(); }
+  });
+});
 
 function eanCheck(body) { return (10 - body.split('').reverse().reduce((sum, digit, index) => sum + Number(digit) * (index % 2 ? 1 : 3), 0) % 10) % 10; }
 function makeCode() { const body = `200${Date.now().toString().slice(-7)}${String(Math.floor(Math.random() * 100)).padStart(2, '0')}`; return `${body}${eanCheck(body)}`; }
@@ -49,7 +56,19 @@ async function startScanner() {
     const video = $('scannerVideo'); scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' } }, audio: false });
     video.srcObject = scanStream; $('scannerPanel').hidden = false; scanning = true;
     const detector = new BarcodeDetector({ formats: ['ean_13', 'ean_8', 'code_128', 'code_39', 'upc_a'] });
-    const scan = async () => { if (!scanning) return; const found = await detector.detect(video); if (found[0]?.rawValue) { $('search').value = found[0].rawValue; stopScanner(); renderSaleProducts(); return; } requestAnimationFrame(scan); };
+    const scan = async () => {
+      if (!scanning) return;
+      const found = await detector.detect(video);
+      if (found[0]?.rawValue) {
+        const code = found[0].rawValue;
+        const product = db.products.find(item => String(item.code || item.barcode) === code);
+        stopScanner();
+        if (!product) { $('search').value = code; renderSaleProducts(); return alert('No encontré ese código. Puedes revisar el producto en el buscador.'); }
+        if (confirm(`¿Confirmar venta de ${product.name} por ${money(product.price)}?`)) { cart = [{ id: product.id, qty: 1 }]; await completeSale(); }
+        return;
+      }
+      requestAnimationFrame(scan);
+    };
     video.onloadeddata = scan;
   } catch (error) { stopScanner(); alert('No se pudo abrir la cámara. Revisa que Safari tenga permiso para usarla.'); }
 }
