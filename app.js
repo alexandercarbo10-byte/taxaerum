@@ -2,6 +2,8 @@ const key = 'taxaerum-local-v1';
 let db = JSON.parse(localStorage.getItem(key) || '{"products":[],"sales":[]}');
 let cart = [], cloudAvailable = false, cloudMode = false;
 let cloudToken = localStorage.getItem('taxaerum-session') || '';
+let cloudRole = localStorage.getItem('taxaerum-role') || 'admin';
+let cloudCashier = localStorage.getItem('taxaerum-session-cashier') || '';
 const $ = id => document.getElementById(id);
 const money = n => new Intl.NumberFormat('es-EC', { style: 'currency', currency: 'USD' }).format(n || 0);
 const save = () => localStorage.setItem(key, JSON.stringify(db));
@@ -36,6 +38,10 @@ function mountCashier() {
   input.onchange = () => localStorage.setItem('taxaerum-cashier', input.value.trim());
   $('recentSales').closest('.card').insertAdjacentHTML('beforeend', '<h2 class="title" style="margin-top:22px">Ventas por persona (hoy)</h2><div id="cashierSummary" class="empty">Aún no hay ventas registradas.</div>');
 }
+function mountRoleAccess() {
+  $('cloudButton').insertAdjacentHTML('afterend', '<button id="sellerButton" class="secondary" hidden>Entrar como vendedor</button>');
+  $('sellerButton').onclick = connectSeller;
+}
 let scanStream, scanning = false;
 async function startScanner() {
   if (!('BarcodeDetector' in window)) return alert('Este navegador no permite escanear con cámara. Puedes usar la cámara normal del iPhone para leer el código o escribirlo en el buscador.');
@@ -56,7 +62,18 @@ async function api(path, options = {}) {
   if (!response.ok) throw new Error(data.error || 'No se pudo conectar con la nube.');
   return data;
 }
-function updateCloudButton() { const b = $('cloudButton'); b.hidden = !cloudAvailable; b.textContent = cloudMode ? 'Nube conectada' : 'Conectar nube'; b.className = cloudMode ? 'primary' : 'secondary'; }
+function applyAccess() {
+  const seller = cloudMode && cloudRole === 'seller';
+  document.querySelector('[data-view="productos"]').hidden = seller;
+  if (seller) { $('cashier').value = cloudCashier; $('cashier').disabled = true; } else $('cashier').disabled = false;
+}
+function clearSession() { cloudMode = false; cloudToken = ''; cloudCashier = ''; localStorage.removeItem('taxaerum-session'); localStorage.removeItem('taxaerum-role'); localStorage.removeItem('taxaerum-session-cashier'); }
+function updateCloudButton() {
+  const admin = $('cloudButton'), seller = $('sellerButton');
+  admin.hidden = !cloudAvailable || (cloudMode && cloudRole === 'seller'); seller.hidden = !cloudAvailable || (cloudMode && cloudRole === 'admin');
+  admin.textContent = cloudMode ? 'Administrador conectado' : 'Entrar como administrador'; admin.className = cloudMode ? 'primary' : 'secondary';
+  seller.textContent = cloudMode ? `Vendedor: ${cloudCashier}` : 'Entrar como vendedor'; seller.className = cloudMode ? 'primary' : 'secondary'; applyAccess();
+}
 async function loadCloud() {
   const [products, summary] = await Promise.all([api('products'), api('dashboard')]);
   db.products = products.map(p => ({ ...p, code: p.barcode, stock: p.stock }));
@@ -64,17 +81,27 @@ async function loadCloud() {
   db.summary = summary; cloudMode = true; save(); updateCloudButton(); render();
 }
 async function connectCloud() {
-  if (cloudMode && confirm('¿Cerrar la conexión de administración en este dispositivo?')) { cloudMode = false; cloudToken = ''; localStorage.removeItem('taxaerum-session'); updateCloudButton(); render(); return; }
+  if (cloudMode && confirm('¿Cerrar la conexión de administración en este dispositivo?')) { clearSession(); updateCloudButton(); render(); return; }
   const password = prompt('Escribe la contraseña de administración de Taxaerum:');
   if (!password) return;
   try {
     const response = await fetch('/api/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password }) });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || 'No se pudo iniciar sesión.');
-    cloudToken = data.token; localStorage.setItem('taxaerum-session', cloudToken); await loadCloud();
+    cloudToken = data.token; cloudRole = 'admin'; cloudCashier = ''; localStorage.setItem('taxaerum-session', cloudToken); localStorage.setItem('taxaerum-role', cloudRole); localStorage.removeItem('taxaerum-session-cashier'); await loadCloud();
   } catch (error) { alert(error.message); }
 }
 $('cloudButton').onclick = connectCloud;
+async function connectSeller() {
+  if (cloudMode && confirm('¿Cerrar la sesión de vendedor en este dispositivo?')) { clearSession(); updateCloudButton(); render(); return; }
+  const name = prompt('Nombre del vendedor:'); if (!name) return;
+  const pin = prompt('PIN de vendedor:'); if (!pin) return;
+  try {
+    const response = await fetch('/api/seller-login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name.trim(), pin }) });
+    const data = await response.json().catch(() => ({})); if (!response.ok) throw new Error(data.error || 'No se pudo iniciar sesión.');
+    cloudToken = data.token; cloudRole = 'seller'; cloudCashier = data.cashier; localStorage.setItem('taxaerum-session', cloudToken); localStorage.setItem('taxaerum-role', cloudRole); localStorage.setItem('taxaerum-session-cashier', cloudCashier); await loadCloud();
+  } catch (error) { alert(error.message); }
+}
 
 function show(id) {
   document.querySelectorAll('.view').forEach(view => view.classList.toggle('active', view.id === id));
@@ -126,7 +153,7 @@ async function completeSale() {
   if (!cart.length) return alert('Agrega al menos un producto.');
   const total = cart.reduce((sum, i) => sum + i.qty * db.products.find(p => p.id === i.id).price, 0);
   try {
-    const cashier = $('cashier').value.trim();
+    const cashier = cloudRole === 'seller' ? cloudCashier : $('cashier').value.trim();
     if (!cashier) return alert('Escribe el nombre del vendedor antes de cobrar.');
     localStorage.setItem('taxaerum-cashier', cashier);
     if (cloudMode) { const result = await api('sales', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ payment: $('payment').value, cashier, items: cart }) }); cart = []; await loadCloud(); alert(`Venta guardada correctamente. Total: ${money(result.total)}`); }
@@ -134,4 +161,4 @@ async function completeSale() {
   } catch (error) { alert(error.message); }
 }
 async function bootCloud() { try { const response = await fetch('/api/status'); if (!response.ok) throw Error(); cloudAvailable = (await response.json()).cloud; updateCloudButton(); if (cloudToken) await loadCloud(); } catch { cloudAvailable = false; updateCloudButton(); } render(); }
-mountScanner(); mountCashier(); render(); bootCloud();
+mountScanner(); mountCashier(); mountRoleAccess(); render(); bootCloud();
