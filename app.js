@@ -131,14 +131,28 @@ function render() {
   $('todaySales').textContent = money(cloudMode ? summary.todaySales : localSales.reduce((sum, sale) => sum + sale.total, 0));
   $('todayUnits').textContent = cloudMode ? (summary.todayUnits || 0) : localSales.reduce((sum, sale) => sum + sale.items.reduce((total, item) => total + item.qty, 0), 0);
   $('productRows').innerHTML = db.products.length ? db.products.map(p => `<tr><td><b>${escapeHtml(p.name)}</b><br><small>${escapeHtml(p.category)}</small></td><td>${escapeHtml(p.section)}</td><td class="code">${escapeHtml(p.code || p.barcode)}</td><td>${money(p.price)}</td><td>${Number(p.stock) <= 3 ? `<b style="color:#b64646">${p.stock}</b>` : p.stock}</td><td><button class="danger" onclick="removeProduct(${p.id})">Eliminar</button></td></tr>`).join('') : '<tr><td colspan="6" class="empty">Todavía no has agregado productos.</td></tr>';
+  if (cloudMode && cloudRole === 'admin') document.querySelectorAll('#productRows tr').forEach((row, index) => { if (db.products[index] && row.lastElementChild) row.lastElementChild.insertAdjacentHTML('afterbegin', `<button class="secondary" onclick="editProduct(${db.products[index].id})">Editar</button> `); });
   const recent = cloudMode ? db.sales : localSales.slice(-5).reverse();
-  $('recentSales').innerHTML = recent.length ? recent.map(s => `<div class="cart-item"><span>${s.units ?? s.items.length} producto(s) · ${escapeHtml(s.payment)}<br><small>${escapeHtml(s.cashier || 'Sin asignar')}</small></span><b>${money(s.total)}</b></div>`).join('') : 'Aún no hay ventas registradas.';
+  $('recentSales').innerHTML = recent.length ? recent.map(s => `<div class="cart-item"><span>${s.units ?? s.items.length} producto(s) · ${escapeHtml(s.payment)}<br><small>Vendedor: ${escapeHtml(s.cashier || 'Sin asignar')}</small></span><b>${money(s.total)}</b></div>`).join('') : 'Aún no hay ventas registradas.';
   const cashierRows = cloudMode ? (summary.byCashier || []) : Object.values(localSales.reduce((all, sale) => { const cashier = sale.cashier || 'Sin asignar'; all[cashier] = all[cashier] || { cashier, sales: 0, total: 0 }; all[cashier].sales++; all[cashier].total += sale.total; return all; }, {}));
   $('cashierSummary').innerHTML = cashierRows.length ? cashierRows.map(row => `<div class="cart-item"><span><b>${escapeHtml(row.cashier)}</b><br><small>${row.sales} venta(s)</small></span><b>${money(row.total)}</b></div>`).join('') : 'Aún no hay ventas registradas.';
   renderSaleProducts(); renderCatalog(db.products);
 }
 function renderCatalog(products) { $('catalogProducts').innerHTML = products.length ? products.map(p => `<article class="product"><span class="badge">${escapeHtml(p.section)}</span><b style="margin-top:8px">${escapeHtml(p.name)}</b><small>${escapeHtml(p.category)}</small><span class="price">${money(p.price)}</span></article>`).join('') : '<p class="empty">El catálogo se llenará al agregar productos.</p>'; }
 async function loadPublicCatalog() { if (!cloudAvailable) return; try { const result = await fetch('/api/catalog'); if (result.ok) renderCatalog(await result.json()); } catch {} }
+async function editProduct(id) {
+  if (!cloudMode || cloudRole !== 'admin') return alert('Solo el administrador puede editar productos.');
+  const product = db.products.find(item => item.id === Number(id)); if (!product) return;
+  const name = prompt('Nombre del producto:', product.name); if (name === null) return;
+  const section = prompt('Sección:', product.section); if (section === null) return;
+  const category = prompt('Categoría (puedes escribir una nueva):', product.category); if (category === null) return;
+  const price = prompt('Precio de venta (USD):', product.price); if (price === null) return;
+  const stock = prompt('Stock actual:', product.stock); if (stock === null) return;
+  try {
+    await api(`products/${id}`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: name.trim(), section: section.trim(), category: category.trim() || 'Sin categoría', price: Number(price), stock: Number(stock) }) });
+    await loadCloud();
+  } catch (error) { alert(error.message); }
+}
 async function removeProduct(id) { if (!confirm('¿Eliminar este producto?')) return; try { if (cloudMode) { await api(`products/${id}`, { method: 'DELETE' }); await loadCloud(); } else { db.products = db.products.filter(p => p.id !== Number(id)); save(); render(); } } catch (error) { alert(error.message); } }
 function renderSaleProducts() {
   const query = $('search').value.toLowerCase();

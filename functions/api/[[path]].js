@@ -62,6 +62,18 @@ export async function onRequest({ request, env }) {
     try { const created = await env.DB.prepare('INSERT INTO products (name, section, category, price, barcode) VALUES (?, ?, ?, ?, ?)').bind(name, section, category, price, barcode).run(); await env.DB.prepare('INSERT INTO inventory (product_id, quantity) VALUES (?, ?)').bind(created.meta.last_row_id, stock).run(); return json({ id: created.meta.last_row_id }, 201); } catch { return json({ error: 'Ese código ya existe o no se pudo guardar.' }, 409); }
   }
   const productMatch = current.match(/^products\/(\d+)$/);
+  if (request.method === 'PATCH' && productMatch) {
+    if (!isAdmin) return json({ error: 'Solo el administrador puede editar productos.' }, 403);
+    const body = await request.json().catch(() => ({}));
+    const name = String(body.name || '').trim(), section = String(body.section || 'General').trim(), category = String(body.category || 'Sin categoría').trim(), price = Number(body.price), stock = Number(body.stock);
+    if (!name || !Number.isFinite(price) || price < 0 || !Number.isInteger(stock) || stock < 0) return json({ error: 'Revisa nombre, precio, stock y categoría.' }, 400);
+    const id = Number(productMatch[1]);
+    await env.DB.batch([
+      env.DB.prepare('UPDATE products SET name=?, section=?, category=?, price=? WHERE id=?').bind(name, section, category, price, id),
+      env.DB.prepare('UPDATE inventory SET quantity=? WHERE product_id=?').bind(stock, id)
+    ]);
+    return json({ ok: true });
+  }
   if (request.method === 'DELETE' && productMatch) { if (!isAdmin) return json({ error: 'Solo el administrador puede eliminar productos.' }, 403); await env.DB.prepare('DELETE FROM products WHERE id=?').bind(Number(productMatch[1])).run(); return json({ ok: true }); }
 
   if (request.method === 'POST' && current === 'sales') {
