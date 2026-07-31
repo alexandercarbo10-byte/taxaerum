@@ -1,5 +1,5 @@
-const CACHE_NAME = 'taxaerum-v7';
-const ASSETS = ['./', './index.html', './app.js', './manifest.webmanifest', './icon.svg'];
+const CACHE_NAME = 'taxaerum-v8';
+const ASSETS = ['./', './index.html', './app.js', './offline-store.js', './manifest.webmanifest', './icon.svg'];
 self.addEventListener('install', event => event.waitUntil(
   caches.open(CACHE_NAME).then(cache => cache.addAll(ASSETS)).then(() => self.skipWaiting())
 ));
